@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF to TTS - Smart History</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding: 20px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        #pdfCanvas {
+            border: 1px solid #ccc;
+            margin: 20px auto;
+            max-width: 100%;
+            height: auto;
+        }
+        #textOutput {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            min-height: 100px;
+            text-align: left;
+            background: #fafafa;
+        }
+        #currentSentence {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #00f;
+            background-color: #f0f8ff;
+            min-height: 50px;
+            font-weight: bold;
+            color: #004085;
+        }
+        #status {
+            color: #666;
+            margin-top: 10px;
+            font-style: italic;
+        }
+        button {
+            padding: 10px 15px;
+            margin: 5px;
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+        }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        
+        #historyList {
+            margin-top: 30px;
+            text-align: left;
+            border: 1px solid #eee;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        #historyList h3 { margin-top: 0; }
+        .history-item {
+            padding: 10px;
+            border-bottom: 1px solid #ddd;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #fff;
+        }
+        .history-item:hover {
+            background-color: #f9f9f9;
+        }
+        .file-info {
+            font-weight: 500;
+            color: #333;
+        }
+        .delete-btn {
+            color: white;
+            background-color: #dc3545;
+            padding: 5px 10px;
+            font-size: 12px;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .delete-btn:hover { background-color: #bd2130; }
+        
+        .controls { margin: 15px 0; }
+        input[type="range"] { vertical-align: middle; }
+    </style>
+</head>
+<body>
+    <h1>Đọc PDF Tiếng Việt (Có lưu tiến độ)</h1>
+    
+    <div style="background: #e9ecef; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+        <input type="file" id="pdfInput" accept=".pdf" />
+        <p style="font-size: 0.9em; color: #555; margin: 5px 0 0 0;">* Chọn lại file cũ để tiếp tục đọc từ trang đã lưu.</p>
+    </div>
+
+    <div class="controls">
+        <button onclick="stopSpeech()">⏹ Dừng</button>
+        <button onclick="pauseSpeech()">⏸ Tạm dừng</button>
+        <button onclick="resumeSpeech()">▶ Tiếp tục</button>
+    </div>
+
+    <div class="controls">
+        <button onclick="previousPage()">Trang trước</button>
+        <input type="number" id="pageInput" min="1" style="width: 60px; padding: 5px;" placeholder="Trang" />
+        <button onclick="goToPage()">Đi đến</button>
+        <button onclick="nextPage()">Trang sau</button>
+    </div>
+    
+    <input type="range" id="pageSlider" min="1" value="1" style="width: 100%;" disabled />
+
+    <canvas id="pdfCanvas"></canvas>
+    
+    <div id="status">Vui lòng chọn file PDF để bắt đầu</div>
+    <div id="currentSentence">Câu đang đọc sẽ hiển thị ở đây...</div>
+    <div id="textOutput">Nội dung văn bản nhận diện...</div>
+
+    <div id="historyList">
+        <h3>Lịch sử đọc (Bookmarks)</h3>
+        <div id="historyContent"></div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.9.359/pdf.min.js"></script>
+    <script src="https://unpkg.com/tesseract.js@v5.0.0/dist/tesseract.min.js"></script>
+    
+    <script>
+        // Cấu hình Worker cho PDF.js
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.9.359/pdf.worker.min.js';
+
+        let pdfDoc = null;
+        let currentPage = 1;
+        let totalPages = 0;
+        let isSpeaking = false;
+        let isPaused = false;
+        let currentUtterance = null;
+        let currentFileName = ""; // Biến lưu tên file hiện tại
+        
+        // Cấu trúc history mới: [{ name: "abc.pdf", page: 5, total: 100 }]
+        let fileHistory = JSON.parse(localStorage.getItem('pdfReadingHistory')) || [];
+
+        // --- Xử lý sự kiện ---
+
+        document.getElementById('pdfInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file && file.type === "application/pdf") {
+                const fileReader = new FileReader();
+                fileReader.onload = function() {
+                    const typedArray = new Uint8Array(this.result);
+                    loadPDF(typedArray, file.name);
+                };
+                fileReader.readAsArrayBuffer(file);
+            }
+        });
+
+        document.getElementById('pageSlider').addEventListener('input', (e) => {
+            document.getElementById('pageInput').value = e.target.value;
+        });
+
+        document.getElementById('pageSlider').addEventListener('change', (e) => {
+            const pageNum = parseInt(e.target.value);
+            stopSpeech();
+            renderPage(pageNum);
+        });
+
+        // --- Các hàm chính ---
+
+        async function loadPDF(data, fileName) {
+            try {
+                // Reset trạng thái
+                stopSpeech();
+                currentFileName = fileName;
+                
+                pdfDoc = await pdfjsLib.getDocument({ data }).promise;
+                totalPages = pdfDoc.numPages;
+
+                // Cập nhật UI controls
+                document.getElementById('pageInput').max = totalPages;
+                document.getElementById('pageSlider').max = totalPages;
+                document.getElementById('pageSlider').disabled = false;
+
+                // Kiểm tra lịch sử để khôi phục trang
+                const historyItem = fileHistory.find(item => item.name === fileName);
+                if (historyItem) {
+                    currentPage = historyItem.page;
+                    // Nếu file đã cập nhật số trang (khác total cũ), cập nhật lại
+                    if (historyItem.total !== totalPages) {
+                         historyItem.total = totalPages;
+                    }
+                    document.getElementById('status').innerText = `Đã khôi phục tiến độ: Trang ${currentPage}`;
+                } else {
+                    currentPage = 1;
+                    // Thêm mới vào lịch sử
+                    saveProgressToHistory(fileName, 1, totalPages);
+                }
+
+                renderPage(currentPage);
+                updateHistoryList(); // Cập nhật danh sách hiển thị
+            } catch (error) {
+                console.error("Lỗi tải PDF:", error);
+                alert("Không thể đọc file PDF này.");
+            }
+        }
+
+        async function renderPage(pageNum) {
+            if (!pdfDoc) return;
+            
+            // Validate số trang
+            if (pageNum < 1) pageNum = 1;
+            if (pageNum > totalPages) pageNum = totalPages;
+            
+            currentPage = pageNum;
+            
+            // Cập nhật UI
+            document.getElementById('pageInput').value = currentPage;
+            document.getElementById('pageSlider').value = currentPage;
+            document.getElementById('status').innerText = `Đang hiển thị trang ${currentPage}/${totalPages}`;
+
+            // --- LƯU TIẾN ĐỘ VÀO LOCALSTORAGE ---
+            saveProgressToHistory(currentFileName, currentPage, totalPages);
+            updateHistoryList();
+            // --------------------------------------
+
+            // Render PDF lên Canvas
+            const page = await pdfDoc.getPage(currentPage);
+            const scale = 1.5;
+            const viewport = page.getViewport({ scale });
+            const canvas = document.getElementById('pdfCanvas');
+            const context = canvas.getContext('2d');
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+
+            const renderContext = {
+                canvasContext: context,
+                viewport: viewport
+            };
+            await page.render(renderContext).promise;
+
+            processPageText(canvas);
+        }
+
+        async function processPageText(canvas) {
+            document.getElementById('status').innerText = `Đang nhận diện văn bản trang ${currentPage}...`;
+            
+            // Dùng Tesseract nhận diện chữ
+            const { data: { text } } = await Tesseract.recognize(
+                canvas,
+                'vie',
+                { logger: m => console.log(m) }
+            );
+
+            // Làm sạch văn bản một chút (loại bỏ quá nhiều xuống dòng thừa)
+            const cleanText = text.replace(/\n\s*\n/g, '\n');
+
+            document.getElementById('textOutput').innerText = cleanText;
+            document.getElementById('status').innerText = `Trang ${currentPage} sẵn sàng đọc`;
+            
+            speakText(cleanText);
+        }
+
+        // --- Chức năng đọc (TTS) ---
+
+        function speakText(text) {
+            if (!text || text.trim() === "") {
+                 document.getElementById('currentSentence').innerText = "(Trang này không có chữ hoặc là hình ảnh)";
+                 return;
+            }
+
+            // Tách câu dựa trên dấu câu (cải tiến regex)
+            const sentences = text.match(/[^.!?\n]+[.!?\n]+/g) || [text];
+            let currentSentenceIndex = 0;
+
+            function speakNextSentence() {
+                if (!isSpeaking) return; // Kiểm tra nếu đã bấm dừng
+
+                if (currentSentenceIndex < sentences.length) {
+                    const sentenceText = sentences[currentSentenceIndex].trim();
+                    if (sentenceText) {
+                        currentUtterance = new SpeechSynthesisUtterance(sentenceText);
+                        currentUtterance.lang = 'vi-VN';
+                        currentUtterance.rate = 1.0; 
+
+                        document.getElementById('currentSentence').innerText = sentenceText;
+
+                        currentUtterance.onend = () => {
+                            currentSentenceIndex++;
+                            speakNextSentence();
+                        };
+
+                        currentUtterance.onerror = (e) => {
+                            console.error("Speech error", e);
+                            currentSentenceIndex++; // Bỏ qua lỗi
+                            speakNextSentence();
+                        }
+                        
+                        window.speechSynthesis.speak(currentUtterance);
+                    } else {
+                         currentSentenceIndex++;
+                         speakNextSentence();
+                    }
+                } else {
+                    // Đọc xong trang
+                    isSpeaking = false;
+                    document.getElementById('currentSentence').innerText = "Đã đọc xong trang này.";
+                    nextPage(); // Tự động chuyển trang
+                }
+            }
+
+            isSpeaking = true;
+            isPaused = false;
+            window.speechSynthesis.cancel(); // Dừng các tác vụ cũ
+            speakNextSentence();
+        }
+
+        function stopSpeech() {
+            window.speechSynthesis.cancel();
+            isSpeaking = false;
+            isPaused = false;
+            document.getElementById('status').innerText = "Đã dừng đọc";
+            document.getElementById('currentSentence').innerText = "...";
+        }
+
+        function pauseSpeech() {
+            if (isSpeaking && !isPaused) {
+                window.speechSynthesis.pause();
+                isPaused = true;
+                document.getElementById('status').innerText = "Đã tạm dừng";
+            }
+        }
+
+        function resumeSpeech() {
+            if (isSpeaking && isPaused) {
+                window.speechSynthesis.resume();
+                isPaused = false;
+                document.getElementById('status').innerText = `Đang đọc trang ${currentPage}`;
+            }
+        }
+
+        // --- Điều hướng trang ---
+
+        function previousPage() {
+            if (currentPage > 1) {
+                stopSpeech();
+                renderPage(currentPage - 1);
+            }
+        }
+
+        function nextPage() {
+            if (currentPage < totalPages) {
+                stopSpeech();
+                renderPage(currentPage + 1);
+            } else {
+                document.getElementById('status').innerText = "Đã đến trang cuối cùng.";
+                stopSpeech();
+            }
+        }
+
+        function goToPage() {
+            const pageNum = parseInt(document.getElementById('pageInput').value);
+            if (pageNum >= 1 && pageNum <= totalPages) {
+                stopSpeech();
+                renderPage(pageNum);
+            } else {
+                alert(`Vui lòng nhập số trang từ 1 đến ${totalPages}`);
+            }
+        }
+
+        // --- Quản lý Lịch sử (Chỉ lưu Metadata) ---
+
+        function saveProgressToHistory(name, page, total) {
+            if (!name) return;
+
+            // Tìm xem file đã có trong lịch sử chưa
+            const index = fileHistory.findIndex(item => item.name === name);
+            
+            if (index !== -1) {
+                // Nếu có rồi, cập nhật trang
+                fileHistory[index].page = page;
+                fileHistory[index].total = total;
+                // Đưa lên đầu danh sách
+                const item = fileHistory.splice(index, 1)[0];
+                fileHistory.unshift(item);
+            } else {
+                // Nếu chưa có, thêm mới
+                fileHistory.unshift({ name: name, page: page, total: total });
+            }
+
+            // Giới hạn lưu 20 file gần nhất để nhẹ bộ nhớ
+            if (fileHistory.length > 20) {
+                fileHistory.pop();
+            }
+
+            localStorage.setItem('pdfReadingHistory', JSON.stringify(fileHistory));
+        }
+
+        function deleteFromHistory(index) {
+            fileHistory.splice(index, 1);
+            localStorage.setItem('pdfReadingHistory', JSON.stringify(fileHistory));
+            updateHistoryList();
+        }
+
+        function updateHistoryList() {
+            const container = document.getElementById('historyContent');
+            container.innerHTML = '';
+
+            if (fileHistory.length === 0) {
+                container.innerHTML = '<p style="color:#888; font-style:italic;">Chưa có lịch sử đọc.</p>';
+                return;
+            }
+
+            fileHistory.forEach((item, index) => {
+                const div = document.createElement('div');
+                div.className = 'history-item';
+
+                // Format hiển thị: filename.pdf (Đang đọc trang X/Y)
+                const textSpan = document.createElement('span');
+                textSpan.className = 'file-info';
+                textSpan.innerText = `${item.name} (Đang đọc trang ${item.page}/${item.total})`;
+                
+                // Sự kiện khi click vào lịch sử -> Nhắc người dùng upload lại file đó
+                textSpan.style.cursor = "pointer";
+                textSpan.onclick = () => {
+                     alert(`Vui lòng chọn lại file "${item.name}" từ máy tính của bạn.\nHệ thống sẽ tự động chuyển đến trang ${item.page}.`);
+                     document.getElementById('pdfInput').click();
+                };
+
+                const deleteBtn = document.createElement('button');
+                deleteBtn.innerText = 'Xóa';
+                deleteBtn.className = 'delete-btn';
+                deleteBtn.onclick = (e) => {
+                    e.stopPropagation(); // Ngăn click nhầm vào text
+                    deleteFromHistory(index);
+                };
+
+                div.appendChild(textSpan);
+                div.appendChild(deleteBtn);
+                container.appendChild(div);
+            });
+        }
+
+        // Khởi tạo danh sách khi tải trang
+        updateHistoryList();
+
+    </script>
+</body>
+</html>
